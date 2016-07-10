@@ -1,0 +1,1 @@
+<?php return true;// Allow or forbid player (AJAX_CHAT_USER) from change his/her display name ?>

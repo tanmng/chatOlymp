@@ -1,0 +1,439 @@
+<?php
+/*
+ * @package AJAX_Chat
+ * @author Sebastian Tschan
+ * @copyright (c) Sebastian Tschan
+ * @license Modified MIT License
+ * @link https://blueimp.net/ajax/
+ */
+
+// Ajax Chat backend logic:
+class AJAXChat {
+
+	var $db;
+	var $_config;
+	var $_requestVars;
+	var $_infoMessages;
+	var $_channels;
+	var $_allChannels;
+	var $_view;
+	var $_lang;
+	var $_invitations;
+	var $_customVars;
+	var $_sessionNew;
+	var $_onlineUsersData;
+	var $_bannedUsersData;
+	var $__sourse_IP_flag = "HTTP_X_FORWARDED_FOR";
+	function AJAXChat() {
+		$this->initialize();
+	}
+
+	function initialize() {
+		// Initialize configuration settings:
+		$this->initConfig();
+
+		// Initialize the DataBase connection:
+		$this->initDataBaseConnection();
+
+		// Initialize request variables:
+		$this->initRequestVars();
+		
+		// Initialize the chat session:
+		$this->initSession();
+		
+		// Handle the browser request and send the response content:
+		$this->handleRequest();
+	}
+
+	function initConfig() {
+		$config = null;
+		if (!include(AJAX_CHAT_PATH.'lib/config.php')) {
+			echo('<strong>Error:</strong> Could not find a config.php file in "'.AJAX_CHAT_PATH.'"lib/". Check to make sure the file exists.');
+			die();
+		}
+		$this->_config = &$config;
+
+		// Initialize custom configuration settings:
+		$this->initCustomConfig();
+	}
+	
+	function initRequestVars() {
+		$this->_requestVars = array();
+		$this->_requestVars['ajax']			= isset($_REQUEST['ajax'])			? true							: false;
+		$this->_requestVars['userID']		= isset($_REQUEST['userID'])		? (int)$_REQUEST['userID']		: null;
+		$this->_requestVars['userName']		= isset($_REQUEST['userName'])		? $_REQUEST['userName']			: null;
+		$this->_requestVars['channelID']	= isset($_REQUEST['channelID'])		? (int)$_REQUEST['channelID']	: null;
+		$this->_requestVars['channelName']	= isset($_REQUEST['channelName'])	? $_REQUEST['channelName']		: null;
+		$this->_requestVars['text']			= isset($_POST['text'])				? $_POST['text']				: null;
+		$this->_requestVars['lastID']		= isset($_REQUEST['lastID'])		? (int)$_REQUEST['lastID']		: 0;
+		$this->_requestVars['login']		= isset($_REQUEST['login'])			? true							: false;
+		$this->_requestVars['logout']		= isset($_REQUEST['logout'])		? true							: false;
+		$this->_requestVars['password']		= isset($_REQUEST['password'])		? $_REQUEST['password']			: null;
+		$this->_requestVars['view']			= isset($_REQUEST['view'])			? $_REQUEST['view']				: null;
+		$this->_requestVars['year']			= isset($_REQUEST['year'])			? (int)$_REQUEST['year']		: null;
+		$this->_requestVars['month']		= isset($_REQUEST['month'])			? (int)$_REQUEST['month']		: null;
+		$this->_requestVars['day']			= isset($_REQUEST['day'])			? (int)$_REQUEST['day']			: null;
+		$this->_requestVars['hour']			= isset($_REQUEST['hour'])			? (int)$_REQUEST['hour']		: null;
+		$this->_requestVars['search']		= isset($_REQUEST['search'])		? $_REQUEST['search']			: null;
+		$this->_requestVars['shoutbox']		= isset($_REQUEST['shoutbox'])		? true							: false;
+		$this->_requestVars['getInfos']		= isset($_REQUEST['getInfos'])		? $_REQUEST['getInfos']			: null;
+		$this->_requestVars['lang']			= isset($_REQUEST['lang'])			? $_REQUEST['lang']				: null;
+		$this->_requestVars['delete']		= isset($_REQUEST['delete'])		? (int)$_REQUEST['delete']		: null;
+		
+		// Initialize custom request variables:
+		$this->initCustomRequestVars();
+		
+		// Remove slashes which have been added to user input strings if magic_quotes_gpc is On:
+		if(get_magic_quotes_gpc()) {
+			// It is safe to remove the slashes as we escape user data ourself
+			array_walk(
+				$this->_requestVars,
+				create_function(
+					'&$value, $key',
+					'if(is_string($value)) $value = stripslashes($value);'
+				)
+			);
+		}
+	}
+	
+	function initDataBaseConnection() {
+		// Create a new database object:
+		$this->db = new AJAXChatDataBase(
+			$this->_config['dbConnection']
+		);
+		// Use a new database connection if no existing is given:
+		if(!$this->_config['dbConnection']['link']) {
+			// Connect to the database server:
+			$this->db->connect($this->_config['dbConnection']);
+			if($this->db->error()) {
+				echo $this->db->getError();
+				die();
+			}
+			// Select the database:
+			$this->db->select($this->_config['dbConnection']['name']);
+			if($this->db->error()) {
+				echo $this->db->getError();
+				die();
+			}
+		}
+		// Unset the dbConnection array for safety purposes:
+		unset($this->_config['dbConnection']);			
+	}
+	
+	function getDataBaseTable($table) {
+		return ($this->db->getName() ? '`'.$this->db->getName().'`.'.$this->getConfig('dbTableNames',$table) : $this->getConfig('dbTableNames',$table));
+	}
+
+	function initSession() {
+		// Start the PHP session (if not already started):
+		$this->startSession();
+
+		if($this->isLoggedIn()) {
+			// Logout if we receive a logout request, the chat has been closed or the userID could not be revalidated:
+			if($this->getRequestVar('logout') || !$this->isChatOpen() || !$this->revalidateUserID()) {
+				$this->logout();
+				return;
+			}
+			// Logout if the Session IP is not the same when logged in and ipCheck is enabled:
+			if($this->getConfig('ipCheck') && ($this->getSessionIP() === null || $this->getSessionIP() != $_SERVER['HTTP_X_FORWARDED_FOR'])) {
+				$this->logout('IP');
+				return;
+			}
+		} else if(
+			// Login if auto-login enabled or a login, userName or shoutbox parameter is given:
+			$this->getConfig('forceAutoLogin') ||
+			$this->getRequestVar('login') ||
+			$this->getRequestVar('userName') ||
+			$this->getRequestVar('shoutbox')
+			) {
+			$this->login();
+		}
+
+		// Initialize the view:
+		$this->initView();
+
+		if($this->getView() == 'chat') {
+			$this->initChatViewSession();
+		} else if($this->getView() == 'logs') {
+			$this->initLogsViewSession();
+		}
+
+		if(!$this->getRequestVar('ajax') && !headers_sent()) {
+			// Set style cookie:
+			$this->setStyle();
+			// Set langCode cookie:
+			$this->setLangCodeCookie();
+		}
+		
+		$this->initCustomSession();
+	}
+
+	function initLogsViewSession() {
+		if($this->getConfig('socketServerEnabled')) {
+			if(!$this->getSessionVar('logsViewSocketAuthenticated')) {
+				$this->updateLogsViewSocketAuthentication();
+				$this->setSessionVar('logsViewSocketAuthenticated', true);
+			}
+		}
+	}
+
+	function updateLogsViewSocketAuthentication() {
+		if($this->getUserRole() != AJAX_CHAT_ADMIN) {
+			$channels = array();
+			foreach($this->getChannels() as $channel) {
+				if($this->getConfig('logsUserAccessChannelList') && !in_array($channel, $this->getConfig('logsUserAccessChannelList'))) {
+					continue;
+				}
+				array_push($channels, $channel);
+			}
+			array_push($channels, $this->getPrivateMessageID());
+			array_push($channels, $this->getPrivateChannelID());
+		} else {
+			// The channelID "ALL" authenticates for all channels:
+			$channels = array('ALL');
+		}
+		$this->updateSocketAuthentication(
+			$this->getUserID(),
+			$this->getSocketRegistrationID(),
+			$channels
+		);
+	}
+
+	function initChatViewSession() {
+		// If channel is not null we are logged in to the chat view:
+		if($this->getChannel() !== null) {
+			// Check if the current user has been logged out due to inactivity:
+			if(!$this->isUserOnline()) {
+				$this->logout();
+				return;
+			}
+			if($this->getRequestVar('ajax')) {
+				$this->initChannel();
+				$this->updateOnlineStatus();
+				$this->checkAndRemoveInactive();
+			}
+		} else {
+			if($this->getRequestVar('ajax')) {
+				// Set channel, insert login messages and add to online list on first ajax request in chat view:
+				$this->chatViewLogin();
+			}
+		}
+	}
+
+	function isChatOpen() {
+		if($this->getUserRole() == AJAX_CHAT_ADMIN)
+			return true;
+		if($this->getConfig('chatClosed'))
+			return false;
+		$time = time();
+		if($this->getConfig('timeZoneOffset') !== null) {
+			// Subtract the server timezone offset and add the config timezone offset:
+			$time -= date('Z', $time);
+			$time += $this->getConfig('timeZoneOffset');
+		}
+		// Check the opening hours:
+		if($this->getConfig('openingHour') < $this->getConfig('closingHour'))
+		{
+			if(($this->getConfig('openingHour') > date('G', $time)) || ($this->getConfig('closingHour') <= date('G', $time)))
+				return false;
+		}
+		else
+		{
+			if(($this->getConfig('openingHour') > date('G', $time)) && ($this->getConfig('closingHour') <= date('G', $time)))
+				return false;
+		}
+		// Check the opening weekdays:
+		if(!in_array(date('w', $time), $this->getConfig('openingWeekDays')))
+			return false;
+		return true;	
+	}
+
+	function handleRequest() {
+		if($this->getRequestVar('ajax')) {
+			if($this->isLoggedIn()) {
+				// Parse info requests (for current userName, etc.):
+				$this->parseInfoRequests();
+	
+				// Parse command requests (e.g. message deletion):
+				$this->parseCommandRequests();
+	
+				// Parse message requests:
+				$this->initMessageHandling();
+			}
+			// Send chat messages and online user list in XML format:
+			$this->sendXMLMessages();
+		} else {
+			// Display XHTML content for non-ajax requests:
+			$this->sendXHTMLContent();
+		}
+	}
+
+	function parseCommandRequests() {
+		if($this->getRequestVar('delete') !== null) {
+			$this->deleteMessage($this->getRequestVar('delete'));
+		}
+	}
+
+	function parseInfoRequests() {
+		if($this->getRequestVar('getInfos')) {
+			$infoRequests = explode(',', $this->getRequestVar('getInfos'));			
+			foreach($infoRequests as $infoRequest) {
+				$this->parseInfoRequest($infoRequest);
+			}
+		}
+	}
+	
+	function parseInfoRequest($infoRequest) {
+		switch($infoRequest) {
+			case 'userID':
+				$this->addInfoMessage($this->getUserID(), 'userID');
+				break;
+			case 'userName':
+				$this->addInfoMessage($this->getUserName(), 'userName');
+				break;
+			case 'userRole':
+				$this->addInfoMessage($this->getUserRole(), 'userRole');
+				break;
+			case 'channelID':
+				$this->addInfoMessage($this->getChannel(), 'channelID');
+				break;
+			case 'channelName':
+				$this->addInfoMessage($this->getChannelName(), 'channelName');
+				break;
+			case 'socketRegistrationID':
+				$this->addInfoMessage($this->getSocketRegistrationID(), 'socketRegistrationID');
+				break;
+			default:
+				$this->parseCustomInfoRequest($infoRequest);
+		}
+	}
+
+	function sendXHTMLContent() {
+		$httpHeader = new AJAXChatHTTPHeader($this->getConfig('contentEncoding'), $this->getConfig('contentType'));
+
+		$template = new AJAXChatTemplate($this, $this->getTemplateFileName(), $httpHeader->getContentType());
+
+		// Send HTTP header:
+		$httpHeader->send();		
+
+		// Send parsed template content:
+		echo $template->getParsedContent();
+	}
+
+	function getTemplateFileName() {
+		switch($this->getView()) {
+			case 'chat':
+				return AJAX_CHAT_PATH.'lib/template/loggedIn.html';
+			case 'logs':
+				return AJAX_CHAT_PATH.'lib/template/logs.html';
+			default:
+				return AJAX_CHAT_PATH.'lib/template/loggedOut.html';
+		}
+	}
+
+	function initView() {
+		$this->_view = null;
+		// "chat" is the default view:
+		$view = ($this->getRequestVar('view') === null) ? 'chat' : $this->getRequestVar('view');
+		if($this->hasAccessTo($view)) {
+			$this->_view = $view;
+		}
+	}
+
+	function getView() {
+		return $this->_view;
+	}
+
+	function hasAccessTo($view) {
+		switch($view) {
+			case 'chat':
+			case 'teaser':
+				if($this->isLoggedIn()) {
+					return true;	
+				}
+				return false;
+			case 'logs':
+				if($this->isLoggedIn() && ($this->getUserRole() == AJAX_CHAT_ADMIN ||
+					($this->getConfig('logsUserAccess') &&
+					($this->getUserRole() == AJAX_CHAT_MODERATOR || $this->getUserRole() == AJAX_CHAT_USER))
+					)) {
+					return true;
+				}
+				return false;
+			default:
+				return false;
+		}
+	}
+	
+	function login() {
+		// Retrieve valid login user data (from request variables or session data):
+		$userData = $this->getValidLoginUserData();
+		
+		if(!$userData) {
+			$this->addInfoMessage('errorInvalidUser');
+			return false;
+		}
+
+		// If the chat is closed, only the admin may login:
+		if(!$this->isChatOpen() && $userData['userRole'] != AJAX_CHAT_ADMIN) {
+			$this->addInfoMessage('errorChatClosed');
+			return false;
+		}
+		
+		if(!$this->getConfig('allowGuestLogins') && $userData['userRole'] == AJAX_CHAT_GUEST) {
+			return false;
+		}
+
+		// Check if userID or userName are already listed online:
+		if($this->isUserOnline($userData['userID']) || $this->isUserNameInUse($userData['userName'])) {
+			if($userData['userRole'] == AJAX_CHAT_USER || $userData['userRole'] == AJAX_CHAT_MODERATOR || $userData['userRole'] == AJAX_CHAT_ADMIN) {
+				// Set the registered user inactive and remove the inactive users so the user can be logged in again:
+				$this->setInactive($userData['userID'], $userData['userName']);
+				$this->removeInactive();
+			} else {
+				$this->addInfoMessage('errorUserInUse');
+				return false;
+			}
+		}
+		
+		// Check if user is banned:
+		if($userData['userRole'] != AJAX_CHAT_ADMIN && $this->isUserBanned($userData['userName'], $userData['userID'], $_SERVER['HTTP_X_FORWARDED_FOR'])) {
+			$this->addInfoMessage('errorBanned');
+			return false;
+		}
+		
+		// Check if the max number of users is logged in (not affecting moderators or admins):
+		if(!($userData['userRole'] == AJAX_CHAT_MODERATOR || $userData['userRole'] == AJAX_CHAT_ADMIN) && $this->isMaxUsersLoggedIn()) {
+			$this->addInfoMessage('errorMaxUsersLoggedIn');
+			return false;
+		}
+
+		// Use a new session id (if session has been started by the chat):
+		$this->regenerateSessionID();
+
+		// Log in:
+		$this->setUserID($userData['userID']);
+		$this->setUserName($userData['userName']);
+		$this->setLoginUserName($userData['userName']);
+		$this->setUserRole($userData['userRole']);
+		
+		/* Customize for arena.olympiavn.org */
+		$this->setDisplayName($userData['displayName']);
+        $this->setTeamName($this->parseTeamName($userData['userName']));
+
+		$this->setLoggedIn(true);	
+		$this->setLoginTimeStamp(time());
+
+		// IP Security check variable:
+		$this->setSessionIP($_SERVER['HTTP_X_FORWARDED_FOR']);
+
+		// The client authenticates to the socket server using a socketRegistrationID:
+		if($this->getConfig('socketServerEnabled')) {
+			$this->setSocketRegistrationID(
+				md5(uniqid(rand(), true))
+			);
+		}
+
+		// Add userID, userName and userRole to info messages:
+		$this->addInfoMessage($this->getUserID(), 'userID');
+		

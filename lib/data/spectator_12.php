@@ -1,0 +1,1 @@
+<?php return true;// Allow or forbid spectator (AJAX_CHAT_GUEST) from chating ?>
